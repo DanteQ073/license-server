@@ -20,6 +20,27 @@ def init_db() -> None:
             )
             """
         )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS issued_licenses (
+                license_key TEXT PRIMARY KEY,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                expires_at TEXT
+            )
+            """
+        )
+
+        # Тестовый ключ для проверки
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO issued_licenses (license_key, is_active, created_at)
+            VALUES (?, 1, ?)
+            """,
+            ("TEST-001", datetime.now(timezone.utc).isoformat()),
+        )
+
         conn.commit()
 
 
@@ -38,6 +59,11 @@ class CheckRequest(BaseModel):
     device_id: str
 
 
+class IssueRequest(BaseModel):
+    license_key: str
+    expires_at: str | None = None  # ISO, например: 2026-12-31T23:59:59+00:00
+
+
 @app.get("/")
 def root():
     return {"ok": True, "message": "license server is running"}
@@ -48,9 +74,61 @@ def health():
     return {"status": "healthy"}
 
 
+@app.post("/admin/issue")
+def admin_issue(payload: IssueRequest):
+    if payload.expires_at:
+        try:
+            dt = datetime.fromisoformat(payload.expires_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="expires_at must be valid ISO datetime")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO issued_licenses
+            (license_key, is_active, created_at, expires_at)
+            VALUES (?, 1, ?, ?)
+            """,
+            (
+                payload.license_key,
+                datetime.now(timezone.utc).isoformat(),
+                payload.expires_at,
+            ),
+        )
+        conn.commit()
+
+    return {"ok": True, "status": "issued", "license_key": payload.license_key}
+
+
 @app.post("/activate")
 def activate(payload: ActivateRequest):
     with sqlite3.connect(DB_PATH) as conn:
+        issued = conn.execute(
+            """
+            SELECT is_active, expires_at
+            FROM issued_licenses
+            WHERE license_key = ?
+            """,
+            (payload.license_key,),
+        ).fetchone()
+
+        if issued is None:
+            raise HTTPException(status_code=403, detail="license key was not issued")
+
+        is_active, expires_at = issued
+
+        if is_active != 1:
+            raise HTTPException(status_code=403, detail="license key is disabled")
+
+        if expires_at:
+            expires_dt = datetime.fromisoformat(expires_at)
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+            if expires_dt < datetime.now(timezone.utc):
+                raise HTTPException(status_code=403, detail="license key is expired")
+
         row = conn.execute(
             "SELECT device_id FROM licenses WHERE license_key = ?",
             (payload.license_key,),
@@ -58,7 +136,10 @@ def activate(payload: ActivateRequest):
 
         if row is None:
             conn.execute(
-                "INSERT INTO licenses (license_key, device_id, activated_at) VALUES (?, ?, ?)",
+                """
+                INSERT INTO licenses (license_key, device_id, activated_at)
+                VALUES (?, ?, ?)
+                """,
                 (
                     payload.license_key,
                     payload.device_id,
@@ -78,14 +159,31 @@ def activate(payload: ActivateRequest):
 def check(payload: CheckRequest):
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT device_id FROM licenses WHERE license_key = ?",
+            """
+            SELECT l.device_id, i.is_active, i.expires_at
+            FROM licenses l
+            LEFT JOIN issued_licenses i ON i.license_key = l.license_key
+            WHERE l.license_key = ?
+            """,
             (payload.license_key,),
         ).fetchone()
 
     if row is None:
         return {"ok": False, "status": "not_found"}
 
-    if row[0] != payload.device_id:
+    device_id, is_active, expires_at = row
+
+    if device_id != payload.device_id:
         return {"ok": False, "status": "device_mismatch"}
+
+    if is_active != 1:
+        return {"ok": False, "status": "disabled"}
+
+    if expires_at:
+        expires_dt = datetime.fromisoformat(expires_at)
+        if expires_dt.tzinfo is None:
+            expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+        if expires_dt < datetime.now(timezone.utc):
+            return {"ok": False, "status": "expired"}
 
     return {"ok": True, "status": "active"}
