@@ -34,7 +34,6 @@ def init_db() -> None:
             """
         )
 
-        # Тестовый ключ (можно убрать позже)
         conn.execute(
             """
             INSERT OR IGNORE INTO issued_licenses (license_key, is_active, created_at)
@@ -63,7 +62,11 @@ class CheckRequest(BaseModel):
 
 class IssueRequest(BaseModel):
     license_key: str
-    expires_at: str | None = None  # ISO datetime, например 2026-12-31T23:59:59+00:00
+    expires_at: str | None = None
+
+
+class DisableRequest(BaseModel):
+    license_key: str
 
 
 @app.get("/")
@@ -108,6 +111,27 @@ def admin_issue(payload: IssueRequest, x_admin_token: str | None = Header(defaul
         conn.commit()
 
     return {"ok": True, "status": "issued", "license_key": payload.license_key}
+
+
+@app.post("/admin/disable")
+def admin_disable(payload: DisableRequest, x_admin_token: str | None = Header(default=None)):
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN is not configured")
+
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid admin token")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE issued_licenses SET is_active = 0 WHERE license_key = ?",
+            (payload.license_key,),
+        )
+        conn.commit()
+
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="license key not found")
+
+    return {"ok": True, "status": "disabled", "license_key": payload.license_key}
 
 
 @app.post("/activate")
