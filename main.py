@@ -1,12 +1,14 @@
-from datetime import datetime, timezone
+import os
 import sqlite3
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 app = FastAPI(title="License Server")
 
 DB_PATH = "licenses.db"
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 
 def init_db() -> None:
@@ -32,7 +34,7 @@ def init_db() -> None:
             """
         )
 
-        # Тестовый ключ для проверки
+        # Тестовый ключ (можно убрать позже)
         conn.execute(
             """
             INSERT OR IGNORE INTO issued_licenses (license_key, is_active, created_at)
@@ -61,7 +63,7 @@ class CheckRequest(BaseModel):
 
 class IssueRequest(BaseModel):
     license_key: str
-    expires_at: str | None = None  # ISO, например: 2026-12-31T23:59:59+00:00
+    expires_at: str | None = None  # ISO datetime, например 2026-12-31T23:59:59+00:00
 
 
 @app.get("/")
@@ -75,12 +77,18 @@ def health():
 
 
 @app.post("/admin/issue")
-def admin_issue(payload: IssueRequest):
+def admin_issue(payload: IssueRequest, x_admin_token: str | None = Header(default=None)):
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN is not configured")
+
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid admin token")
+
     if payload.expires_at:
         try:
-            dt = datetime.fromisoformat(payload.expires_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+            expires_dt = datetime.fromisoformat(payload.expires_at)
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=timezone.utc)
         except ValueError:
             raise HTTPException(status_code=400, detail="expires_at must be valid ISO datetime")
 
